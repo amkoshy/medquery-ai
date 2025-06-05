@@ -1,4 +1,12 @@
+openai
 sentence-transformers
-faiss-cpu
-google-cloud-storage
-boto3
+faiss-gpu
+rank_bm25
+tqdm
+numpy
+pandas
+scikit-learn
+python-dotenv
+PyMuPDF
+transformers
+torch
