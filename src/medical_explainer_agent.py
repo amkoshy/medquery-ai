@@ -14,6 +14,10 @@ from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer, util as st_util
 import faiss
 from sklearn.metrics.pairwise import cosine_similarity
+from sentence_transformers import CrossEncoder
+
+# Load once, re-use globally
+cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 # -------------------------------
 # Embedding and Retrieval
@@ -66,7 +70,7 @@ def retrieve_top_chunks(query, jsonl_path, index_path, alpha, top_k, model_name)
 
 def generate_rag_prompt(query, chunks):
     context = "\n\n".join(chunk["text"] for chunk in chunks)
-    return f"""Use the following chunks to answer the question. If partially useful, make reasonable inferences. Say "No relevant information found" only if truly nothing helps.
+    return f"""Use the following chunks to answer the question. If partially useful, make reasonable inferences. Say \"No relevant information found\" only if truly nothing helps.
 
 ### Context:
 {context}
@@ -109,6 +113,7 @@ def run_rag(query, chunk_path, index_path, top_k, model_name):
     chunk_texts = [chunk["text"] for chunk in chunks]
     cos_sim_chunks, semantic_sim = compute_similarity(query_vector, chunk_texts, answer, model_name)
 
+
     return {
         "query": query,
         "chunks": chunks,
@@ -128,11 +133,19 @@ class AgentState(TypedDict):
     answer: Optional[str]
     citations: Optional[str]
     rag_output: Optional[dict]
+    confidence: Optional[float]
+    reranked_chunks: Optional[List[dict]]
 
 def build_app(chunk_path, index_path, top_k, model_name):
     def node_rag_query(state: AgentState) -> AgentState:
         result = run_rag(state["query"], chunk_path, index_path, top_k, model_name)
-        return {**state, "answer": result["answer"], "rag_output": result}
+        result["model_name"] = model_name
+        return {
+            **state,
+            "answer": result["answer"],
+            "rag_output": result,
+            "confidence": result["semantic_similarity"]
+        }
 
     def node_explain_citations(state: AgentState) -> AgentState:
         query, answer = state["query"], state["answer"]
@@ -154,13 +167,100 @@ Use bullet points like:
         )
         return {**state, "citations": response.choices[0].message.content}
 
+    def rerank_chunks_with_cross_encoder(state: AgentState) -> AgentState:
+        query = state["query"]
+        original_chunks = state["rag_output"]["chunks"]
+
+        if not original_chunks:
+            return state
+
+        # Step 1: Re-rank with cross-encoder
+        inputs = [(query, chunk["text"]) for chunk in original_chunks]
+        scores = cross_encoder.predict(inputs)
+        reranked_chunks = [x for _, x in sorted(zip(scores, original_chunks), reverse=True)]
+
+        # Step 2: Generate a new answer using reranked chunks
+        prompt = generate_rag_prompt(query, reranked_chunks)
+        answer, input_tokens, output_tokens = generate_answer_openai(prompt)
+
+        # Step 3: Recompute similarity
+        chunk_texts = [chunk["text"] for chunk in reranked_chunks]
+        query_vec = embed_query(query, model_name=state["rag_output"]["model_name"])
+        cos_sim_chunks, semantic_sim = compute_similarity(query_vec, chunk_texts, answer, model_name=state["rag_output"]["model_name"])
+
+        # Step 4: Return updated state
+        return {
+            **state,
+            "answer": answer,
+            "confidence": semantic_sim,
+            "rag_output": {
+                "query": query,
+                "chunks": reranked_chunks,
+                "answer": answer,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cosine_similarities": cos_sim_chunks,
+                "semantic_similarity": semantic_sim,
+                "model_name": state["rag_output"]["model_name"]
+            }
+        }
+
+
+    def check_confidence(state: AgentState) -> str:
+        rag_output = state.get("rag_output", {})
+        chunk_sims = rag_output.get("cosine_similarities", [])
+        citations = rag_output.get("citations", [])
+
+        if not chunk_sims:
+            print("[DEBUG] No chunk similarities found. Reranking...")
+            return "low"
+
+        max_sim = max(chunk_sims)
+        avg_sim = sum(chunk_sims) / len(chunk_sims)
+        
+        print(f"[DEBUG] Max Chunk Similarity: {max_sim:.3f}")
+        print(f"[DEBUG] Avg Chunk Similarity: {avg_sim:.3f}")
+        
+        # Add this block here
+        if max_sim < 0.5:
+            print("[DEBUG] Query too far from knowledge base. Returning fallback.")
+            state["answer"] = "No relevant information found in the current knowledge base."
+            state["citations"] = "No citations available."
+            return "done"  # This must route to a terminal node
+
+
+    def node_fallback(state: AgentState) -> AgentState:
+        return state
+
     graph = StateGraph(AgentState)
+
+    # Define all nodes
     graph.add_node("RAGQuery", node_rag_query)
     graph.add_node("ExplainCitations", node_explain_citations)
+    graph.add_node("RerankChunks", rerank_chunks_with_cross_encoder)
+
+    # Add fallback node to safely exit when query is too far from knowledge base
+    def node_fallback(state: AgentState) -> AgentState:
+        return state
+    graph.add_node("Fallback", node_fallback)
+
+    # Set entry point
     graph.set_entry_point("RAGQuery")
-    graph.add_edge("RAGQuery", "ExplainCitations")
+
+    # Conditional routing based on chunk similarity and presence of citations
+    graph.add_conditional_edges("RAGQuery", check_confidence, {
+        "good": "ExplainCitations",
+        "low": "RerankChunks",
+        "done": "Fallback"
+    })
+
+    # Fixed transitions
+    graph.add_edge("RerankChunks", "ExplainCitations")
     graph.add_edge("ExplainCitations", END)
+    graph.add_edge("Fallback", END)
+
     return graph.compile()
+
 
 # -------------------------------
 # CLI Mode
@@ -188,7 +288,7 @@ if __name__ == "__main__":
         result = {
             "query": query,
             "answer": output["answer"],
-            "citations": output["citations"],
+            "citations": output.get("citations", "No citations available."),
             **output.get("rag_output", {})
         }
         results.append(result)

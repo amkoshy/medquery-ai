@@ -35,9 +35,9 @@ if uploaded_file:
                 output = rag_agent.invoke({"query": query})
                 result = {
                     "query": query,
-                    "answer": output["answer"],
-                    "citations": output["citations"],
-                    **output["rag_output"]
+                    "answer": output.get("answer", "No answer"),
+                    "citations": output.get("citations", "No citations generated"),
+                    **output.get("rag_output", {})
                 }
                 results.append(result)
 
